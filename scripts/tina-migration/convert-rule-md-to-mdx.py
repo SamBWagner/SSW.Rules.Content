@@ -9,6 +9,7 @@ email templates, and aside blocks.
 
 Usage:
     python convert-rule-md-to-mdx.py [path] [file_name]
+    python convert-rule-md-to-mdx.py --update-categories [rules_dir]
 
 Parameters:
     path        - Optional. Can be a Markdown file path or a directory path.
@@ -20,10 +21,15 @@ Parameters:
                   Specifies which .md file to process in each subfolder.
                   If omitted, the first .md file in each subfolder is used.
 
+    --update-categories - Flag to update existing MDX files with categories
+                          from rule-to-categories.json. If categories already
+                          exist in the file, they are preserved.
+
 Examples:
     python convert-rule-md-to-mdx.py                              # Transforms all rule.md files in ./rules/
     python convert-rule-md-to-mdx.py rules custom_rule.md         # Transforms custom_rule.md in each subfolder under ./rules/
     python convert-rule-md-to-mdx.py rules/someRule/rule.md       # Transforms only the specified file
+    python convert-rule-md-to-mdx.py --update-categories public/uploads/rules  # Updates categories in all rule.mdx files
 
 Notes:
     - The original .md file will be deleted after successful transformation.
@@ -37,6 +43,7 @@ from pathlib import Path
 import time
 import sys
 import json
+import glob
 
 # ----------------------------- #
 # Configuration
@@ -756,20 +763,346 @@ def transform_all_mds(base_dir=DEFAULT_BASE_DIR, file_name=DEFAULT_FILE_NAME):
     elapsed = end_time - start_time
     print(f"\n✅ Finished processing {count} rule files in {elapsed:.2f} seconds.")
 
+
+# ----------------------------- #
+# Category Update Functions
+# ----------------------------- #
+
+def extract_frontmatter(content):
+    """Extract frontmatter from MDX content."""
+    match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+    if match:
+        return match.group(1)
+    return None
+
+def parse_frontmatter(fm_text):
+    """Parse YAML-like frontmatter into a dictionary, preserving structure."""
+    lines = fm_text.split('\n')
+    data = {}
+    current_list_key = None
+    current_list_item = None
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        base_indent = 0
+        
+        # Skip empty lines
+        if not stripped:
+            i += 1
+            continue
+        
+        # Determine base indent for lists (first list item)
+        if current_list_key and not current_list_item:
+            # Find first list item indent
+            for j in range(i, len(lines)):
+                if lines[j].strip().startswith('-'):
+                    base_indent = len(lines[j]) - len(lines[j].lstrip())
+                    break
+        
+        # Handle list items (indented with -)
+        if stripped.startswith('- '):
+            if current_list_key:
+                list_item = stripped[2:].strip()
+                # Handle object items in list (categories with category field, or other objects)
+                if ':' in list_item:
+                    # Simple key-value on same line
+                    key, val = list_item.split(':', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    # Check if next line is indented (nested object)
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1]
+                        next_indent = len(next_line) - len(next_line.lstrip())
+                        if next_indent > base_indent and ':' in next_line.strip():
+                            # Start of nested object
+                            current_list_item = {key: val}
+                            data[current_list_key].append(current_list_item)
+                        else:
+                            # Simple key-value pair
+                            if current_list_key not in data:
+                                data[current_list_key] = []
+                            if 'category:' in list_item:
+                                cat_value = list_item.split(':', 1)[1].strip()
+                                data[current_list_key].append({'category': cat_value})
+                            else:
+                                data[current_list_key].append(list_item)
+                    else:
+                        # Last line, simple key-value
+                        if current_list_key not in data:
+                            data[current_list_key] = []
+                        if 'category:' in list_item:
+                            cat_value = list_item.split(':', 1)[1].strip()
+                            data[current_list_key].append({'category': cat_value})
+                        else:
+                            data[current_list_key].append(list_item)
+                else:
+                    # Simple string item
+                    if current_list_key not in data:
+                        data[current_list_key] = []
+                    data[current_list_key].append(list_item)
+            i += 1
+            continue
+        
+        # Handle nested object properties (indented key-value within list item)
+        if current_list_item and indent > base_indent and ':' in stripped:
+            key, value = stripped.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            current_list_item[key] = value
+            i += 1
+            continue
+        
+        # Reset list state when we encounter a new top-level key
+        current_list_item = None
+        current_list_key = None
+        
+        if ':' in stripped and indent == 0:
+            key, value = stripped.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            
+            # Check if next line is a list (indented with -)
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                next_indent = len(next_line) - len(next_line.lstrip())
+                if next_indent > 0 and next_line.strip().startswith('-'):
+                    current_list_key = key
+                    data[key] = []
+                    i += 1
+                    continue
+            
+            data[key] = value
+        
+        i += 1
+    
+    return data
+
+def format_frontmatter(data):
+    """Format dictionary back into YAML-like frontmatter string."""
+    lines = []
+    keys = list(data.keys())
+    
+    for i, key in enumerate(keys):
+        value = data[key]
+        if isinstance(value, list):
+            if len(value) == 0:
+                lines.append(f"{key}: []")
+            else:
+                lines.append(f"{key}:")
+                for item in value:
+                    if isinstance(item, dict):
+                        # Handle category objects with nested properties
+                        for sub_key, sub_value in item.items():
+                            lines.append(f"  - {sub_key}: {sub_value}")
+                    else:
+                        lines.append(f"  - {item}")
+        elif isinstance(value, dict):
+            lines.append(f"{key}:")
+            for sub_key, sub_value in value.items():
+                lines.append(f"  {sub_key}: {sub_value}")
+        else:
+            # Preserve original formatting for simple values
+            lines.append(f"{key}: {value}")
+    
+    return '\n'.join(lines)
+
+def build_category_uri_to_path_map(categories_root='categories'):
+    """Build a mapping from category URI to full category file path."""
+    script_dir = Path(__file__).parent
+    repo_root = script_dir.parent.parent
+    categories_path = repo_root / categories_root
+    pattern = str(categories_path / '**' / '*.mdx')
+    mdx_files = glob.glob(pattern, recursive=True)
+    
+    mdx_files = [f for f in mdx_files if not f.endswith('index.mdx')]
+    uri_to_path = {}
+    
+    for file_path in mdx_files:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        fm_text = extract_frontmatter(content)
+        if not fm_text:
+            continue
+        
+        fm_data = parse_frontmatter(fm_text)
+        category_uri = fm_data.get('uri', '')
+        
+        if category_uri:
+            # Convert absolute path to relative path from repo root
+            rel_path = Path(file_path).relative_to(repo_root)
+            # Normalize to forward slashes for cross-platform compatibility
+            rel_path_str = str(rel_path).replace('\\', '/')
+            uri_to_path[category_uri] = rel_path_str
+    
+    return uri_to_path
+
+def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_path):
+    """Update or add categories to an MDX file's frontmatter."""
+    path = Path(mdx_file_path)
+    if not path.exists():
+        print(f"[WARNING] File not found: {mdx_file_path}")
+        return False
+    
+    content = path.read_text(encoding='utf-8')
+    
+    # Extract frontmatter with better regex to preserve formatting
+    fm_match = re.match(r'^(---\s*\n)(.*?)(\n---\s*\n)', content, re.DOTALL)
+    if not fm_match:
+        print(f"[WARNING] No frontmatter found in: {mdx_file_path}")
+        return False
+    
+    fm_prefix = fm_match.group(1)
+    fm_text = fm_match.group(2)
+    fm_suffix = fm_match.group(3)
+    body = content[fm_match.end():]
+    
+    # Parse frontmatter - preserve original lines for non-category fields
+    fm_lines = fm_text.split('\n')
+    fm_data = parse_frontmatter(fm_text)
+    
+    # Get rule URI
+    rule_uri = fm_data.get('uri', '')
+    if not rule_uri:
+        # Try to get URI from folder name
+        rule_uri = path.parent.name
+    
+    if not rule_uri:
+        print(f"[WARNING] Could not determine rule URI for: {mdx_file_path}")
+        return False
+    
+    # Get categories for this rule
+    category_uris = rule_to_categories.get(rule_uri, [])
+    if not category_uris:
+        # No categories to add, skip
+        return False
+    
+    # Get existing categories if any
+    existing_categories = fm_data.get('categories', [])
+    existing_category_paths = set()
+    
+    # Extract existing category paths
+    if isinstance(existing_categories, list):
+        for cat in existing_categories:
+            if isinstance(cat, dict) and 'category' in cat:
+                existing_category_paths.add(cat['category'])
+            elif isinstance(cat, str):
+                # Handle if categories is a list of strings
+                existing_category_paths.add(cat)
+    
+    # Build new categories list
+    new_categories = []
+    
+    # Preserve existing categories
+    if isinstance(existing_categories, list):
+        for cat in existing_categories:
+            if isinstance(cat, dict) and 'category' in cat:
+                new_categories.append(cat)
+            elif isinstance(cat, str):
+                new_categories.append({'category': cat})
+    
+    # Add new categories from mapping
+    for category_uri in category_uris:
+        category_path = category_uri_to_path.get(category_uri)
+        if category_path:
+            # Check if already exists
+            if category_path not in existing_category_paths:
+                new_categories.append({'category': category_path})
+        else:
+            print(f"[WARNING] Could not find path for category URI: {category_uri} for rule: {rule_uri}")
+    
+    # Check if we need to update
+    needs_update = False
+    if new_categories and len(new_categories) != len(existing_categories):
+        needs_update = True
+    elif new_categories:
+        # Check if all existing categories are still there and if any new ones were added
+        new_paths = {cat.get('category') if isinstance(cat, dict) else cat for cat in new_categories}
+        if new_paths != existing_category_paths:
+            needs_update = True
+    
+    if needs_update:
+        fm_data['categories'] = new_categories
+        
+        # Format and write back - preserve other fields as-is
+        new_fm_text = format_frontmatter(fm_data)
+        new_content = fm_prefix + new_fm_text + fm_suffix + body
+        
+        path.write_text(new_content, encoding='utf-8')
+        return True
+    
+    return False
+
+def update_all_mdx_categories(rules_dir='public/uploads/rules', rule_to_categories_file='rule-to-categories.json'):
+    """Update categories in all rule.mdx files."""
+    script_dir = Path(__file__).parent
+    repo_root = script_dir.parent.parent
+    
+    # Load rule-to-categories mapping
+    rule_to_cats_path = repo_root / rule_to_categories_file
+    if not rule_to_cats_path.exists():
+        print(f"[ERROR] rule-to-categories.json not found at: {rule_to_cats_path}")
+        return
+    
+    with open(rule_to_cats_path, 'r', encoding='utf-8') as f:
+        rule_to_categories = json.load(f)
+    
+    # Build category URI to path mapping
+    print("[INFO] Building category URI to path mapping...")
+    category_uri_to_path = build_category_uri_to_path_map()
+    print(f"[INFO] Found {len(category_uri_to_path)} categories.")
+    
+    # Find all rule.mdx files
+    rules_path = repo_root / rules_dir
+    if not rules_path.exists():
+        print(f"[ERROR] Rules directory not found: {rules_path}")
+        return
+    
+    pattern = str(rules_path / '**' / 'rule.mdx')
+    mdx_files = glob.glob(pattern, recursive=True)
+    
+    print(f"[INFO] Found {len(mdx_files)} rule.mdx files.")
+    print("[INFO] Updating categories...")
+    
+    updated_count = 0
+    skipped_count = 0
+    
+    for mdx_file in mdx_files:
+        try:
+            updated = update_mdx_categories(mdx_file, rule_to_categories, category_uri_to_path)
+            if updated:
+                updated_count += 1
+                print(f"[INFO] Updated: {mdx_file}")
+            else:
+                skipped_count += 1
+        except Exception as e:
+            print(f"[ERROR] Failed to process {mdx_file}: {e}")
+    
+    print(f"\n✅ Finished updating categories.")
+    print(f"   Updated: {updated_count} files")
+    print(f"   Skipped: {skipped_count} files")
+
 # ----------------------------- #
 # Entry Point
 # ----------------------------- #
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
-        arg = sys.argv[1]
-        path = Path(arg)
-        if path.is_file():
-            transform_md_to_mdx(arg)
-        elif path.is_dir():
-            file_name = sys.argv[2] if len(sys.argv) > 2 else None
-            transform_all_mds(arg, file_name)
+        if sys.argv[1] == '--update-categories':
+            rules_dir = sys.argv[2] if len(sys.argv) > 2 else 'public/uploads/rules'
+            update_all_mdx_categories(rules_dir)
         else:
-            print(f"Error: The provided path '{arg}' is neither a file nor a directory.")
+            arg = sys.argv[1]
+            path = Path(arg)
+            if path.is_file():
+                transform_md_to_mdx(arg)
+            elif path.is_dir():
+                file_name = sys.argv[2] if len(sys.argv) > 2 else None
+                transform_all_mds(arg, file_name)
+            else:
+                print(f"Error: The provided path '{arg}' is neither a file nor a directory.")
     else:
         transform_all_mds()
