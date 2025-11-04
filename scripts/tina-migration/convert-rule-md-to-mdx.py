@@ -986,7 +986,7 @@ def build_category_uri_to_path_map(categories_root='categories'):
     return uri_to_path
 
 def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_path):
-    """Update or add categories to an MDX file's frontmatter, placing it right after title."""
+    """Update or add categories to an MDX file's frontmatter, placing it directly under the title field."""
     path = Path(mdx_file_path)
     if not path.exists():
         print(f"[WARNING] File not found: {mdx_file_path}")
@@ -1034,42 +1034,57 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
     categories_start_idx = None
     categories_end_idx = None
     in_categories_block = False
+    categories_indent = None
     
     for i, line in enumerate(fm_lines):
         stripped = line.strip()
-        if stripped.startswith('categories:'):
+        indent_i = len(line) - len(line.lstrip())
+        if stripped.startswith('categories:') and indent_i == 0:
             categories_start_idx = i
             in_categories_block = True
-            # Extract existing category paths from subsequent lines
+            categories_indent = indent_i
             continue
         elif in_categories_block:
-            if stripped.startswith('- category:'):
-                cat_path = stripped.split(':', 1)[1].strip()
-                existing_category_paths.add(cat_path)
-            elif stripped.startswith('- '):
-                # Other list item in categories
-                cat_val = stripped[2:].strip()
-                existing_category_paths.add(cat_val)
-            elif stripped and not line.strip().startswith('-') and ':' in stripped:
-                # New key encountered, end of categories block
+            # Determine end of categories block: any line with indent <= categories_indent
+            # or a new top-level key or list item signals the end
+            if not stripped:
+                continue
+            if indent_i <= (categories_indent or 0):
                 categories_end_idx = i
                 in_categories_block = False
-            elif not stripped:
-                # Empty line might be within categories or after
                 continue
+            if stripped.startswith('- '):
+                # Treat as a categories list item only if it's more indented than the 'categories:' line
+                # (expected list items are indented)
+                if indent_i > (categories_indent or 0):
+                    if stripped.startswith('- category:'):
+                        cat_path = stripped.split(':', 1)[1].strip()
+                        existing_category_paths.add(cat_path)
+                    else:
+                        cat_val = stripped[2:].strip()
+                        existing_category_paths.add(cat_val)
+                else:
+                    # A top-level '- ' means categories block ended before this line
+                    categories_end_idx = i
+                    in_categories_block = False
+                    continue
+            else:
+                # Non-list, still within categories indentation -> treat as continuation of categories item
+                # Do nothing for extraction
+                pass
     
     if in_categories_block:
         categories_end_idx = len(fm_lines)
     
     # Build new categories list
     new_categories_to_add = []
-    
-    
+
     # Find title line index and determine where title ends (handle multi-line titles)
     title_idx = None
     title_end_idx = None
     for i, line in enumerate(fm_lines):
-        if line.strip().startswith('title:'):
+        indent_i = len(line) - len(line.lstrip())
+        if indent_i == 0 and line.strip().startswith('title:'):
             title_idx = i
             # Extract the title value part (after 'title:')
             title_line = line
@@ -1188,11 +1203,11 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
     # Determine if update is needed (categories differ from expected or incorrectly placed)
     categories_differ = expected_category_paths != existing_category_paths
     categories_incorrectly_placed = False
-    
+
     if categories_start_idx is not None:
-        # Check if categories are correctly placed right after title
-        expected_range = range(title_idx + 1, title_idx + 4)  # Allow 1-3 lines after title
-        if categories_start_idx not in expected_range:
+        indent_categories = len(fm_lines[categories_start_idx]) - len(fm_lines[categories_start_idx].lstrip())
+        # Consider incorrect if nested (indented) or not placed immediately after the title block
+        if indent_categories > 0 or categories_start_idx != title_end_idx:
             categories_incorrectly_placed = True
     
     # If categories match and are correctly placed, no update needed
@@ -1201,74 +1216,32 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
     
     # Build new frontmatter lines - preserve everything exactly except categories placement
     new_fm_lines = []
-    insert_categories_after = title_end_idx  # Insert after title ends (handles multi-line titles)
-    
+    insert_after_idx = title_end_idx
+
     # Determine what to skip (the old categories block if it exists)
     skip_range = set()
     if categories_start_idx is not None:
         skip_range = set(range(categories_start_idx, categories_end_idx))
-    
-    # Check for broken title pattern: title line, then categories, then orphaned text that should be part of title
-    title_continuation_after_categories = None
-    if categories_start_idx is not None and categories_start_idx > title_idx:
-        # Check if there's text after categories that looks like title continuation
-        if categories_end_idx < len(fm_lines):
-            next_line_after_cats = fm_lines[categories_end_idx].strip()
-            # If next line doesn't have ':' (not a key) and looks like text, might be title continuation
-            if next_line_after_cats and ':' not in next_line_after_cats:
-                # Check if it could be title continuation (ends with ? or looks like sentence end)
-                if next_line_after_cats.endswith('?') or (len(next_line_after_cats) < 50 and 
-                    not next_line_after_cats[0].isupper() and 
-                    all(c.isalnum() or c in " '-?!" for c in next_line_after_cats)):
-                    # Check if line after that is a proper key
-                    if categories_end_idx + 1 < len(fm_lines):
-                        line_after = fm_lines[categories_end_idx + 1].strip()
-                        if ':' in line_after:
-                            key_part = line_after.split(':', 1)[0].strip()
-                            if key_part and all(c.isalnum() or c in '-_' for c in key_part):
-                                # This looks like title continuation that got orphaned
-                                title_continuation_after_categories = categories_end_idx
-                                # Extend title_end_idx to include this continuation
-                                title_end_idx = categories_end_idx + 1
-    
-    # Process each line, inserting categories after title
+
+    # Rebuild frontmatter lines and insert categories after the chosen block
+    inserted = False
     for i in range(len(fm_lines)):
-        # Add all title lines first (including multi-line titles and any orphaned continuation)
-        if i < title_end_idx:
-            # If this is an orphaned continuation line, merge it with the title
-            if i == title_continuation_after_categories:
-                # Merge with previous title line
-                if new_fm_lines and new_fm_lines[-1].strip().startswith('title:'):
-                    # Append continuation to title value
-                    last_line = new_fm_lines[-1]
-                    continuation = fm_lines[i].strip()
-                    # Merge: add space and continuation
-                    if ':' in last_line:
-                        title_parts = last_line.split(':', 1)
-                        merged_title = f"{title_parts[0]}: {title_parts[1].rstrip()} {continuation}"
-                        new_fm_lines[-1] = merged_title
-                    continue
-            new_fm_lines.append(fm_lines[i])
-            continue
-        
-        # If this is where title ends, insert categories here
-        if i == title_end_idx:
-            # Insert categories right after title (sync with mapping - only expected categories)
-            if expected_category_paths:
-                new_fm_lines.append('categories:')
-                for cat_path in sorted(expected_category_paths):  # Sort for consistency
-                    new_fm_lines.append(f"  - category: {cat_path}")
-        
-        # Skip lines that are part of the old categories block
         if i in skip_range:
             continue
-        
-        # Skip orphaned title continuation (we already merged it)
-        if i == title_continuation_after_categories:
-            continue
-        
-        # Add all other lines as-is
         new_fm_lines.append(fm_lines[i])
+        if not inserted and i == insert_after_idx - 1:
+            if expected_category_paths:
+                new_fm_lines.append('categories:')
+                for cat_path in sorted(expected_category_paths):
+                    new_fm_lines.append(f"  - category: {cat_path}")
+            inserted = True
+
+    # If we need to insert at EOF (e.g., authors at the end)
+    if not inserted and insert_after_idx >= len(fm_lines):
+        if expected_category_paths:
+            new_fm_lines.append('categories:')
+            for cat_path in sorted(expected_category_paths):
+                new_fm_lines.append(f"  - category: {cat_path}")
     
     # Reconstruct the file
     new_fm_text = '\n'.join(new_fm_lines)
