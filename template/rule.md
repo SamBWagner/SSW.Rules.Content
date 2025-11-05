@@ -7,8 +7,6 @@ guid: {{guid}}
 uri: {{uri}}
 created: {{date_created}}
 authors: []
-related:
-
 ---
 
 
